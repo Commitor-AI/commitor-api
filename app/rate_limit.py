@@ -47,3 +47,4 @@ def rate_limit_dependency(limiter: RateLimiter) -> Callable[[Request], Awaitable
 settings = get_settings()
 login_limiter = RateLimiter(settings.login_rate_limit, settings.rate_limit_window_seconds)
 signup_limiter = RateLimiter(settings.signup_rate_limit, settings.rate_limit_window_seconds)
+analyze_limiter = RateLimiter(settings.analyze_rate_limit, settings.rate_limit_window_seconds)
