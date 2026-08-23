@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends
 
 from app.dependencies.auth import get_current_user_from_api_key
 from app.models.user import User
-from app.rate_limit import analyze_limiter, rate_limit_dependency
+from app.rate_limit import enforce_analyze_rate_limit
 from app.schemas.analyze import AnalyzeRequest, AnalyzeResponse
 from app.services.analyzer import analyze_diff
 
@@ -12,7 +12,7 @@ router = APIRouter()
 @router.post(
     "",
     response_model=AnalyzeResponse,
-    dependencies=[Depends(rate_limit_dependency(analyze_limiter))],
+    dependencies=[Depends(enforce_analyze_rate_limit)],
 )
 async def analyze(
     payload: AnalyzeRequest,

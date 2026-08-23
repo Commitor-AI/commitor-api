@@ -13,7 +13,6 @@ class Settings(BaseSettings):
     login_rate_limit: int = 10
     signup_rate_limit: int = 5
     rate_limit_window_seconds: int = 300
-    analyze_rate_limit: int = 20
 
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
