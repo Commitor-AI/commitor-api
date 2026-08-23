@@ -23,3 +23,10 @@ class UserRead(BaseModel):
     email: EmailStr
     plan: Plan
     created_at: datetime
+
+
+class Me(BaseModel):
+    """Account summary behind a presented credential (`GET /auth/me`)."""
+
+    email: EmailStr
+    plan: Plan

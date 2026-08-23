@@ -7,12 +7,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.dependencies.auth import get_current_user_from_jwt
+from app.dependencies.auth import get_current_user_from_api_key, get_current_user_from_jwt
 from app.models.api_key import ApiKey
 from app.models.user import User
 from app.rate_limit import login_limiter, rate_limit_dependency, signup_limiter
 from app.schemas.api_key import ApiKeyCreate, ApiKeyCreated, ApiKeyRead
-from app.schemas.auth import Token, UserCreate
+from app.schemas.auth import Me, Token, UserCreate
 from app.security.api_keys import generate_api_key, hash_api_key
 from app.security.jwt_handler import create_access_token
 from app.security.passwords import hash_password, verify_password
@@ -52,6 +52,12 @@ async def login(payload: UserCreate, db: AsyncSession = Depends(get_db)) -> Toke
     if user is None or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     return Token(access_token=create_access_token(user.id, user.plan))
+
+
+@router.get("/me", response_model=Me)
+async def me(user: User = Depends(get_current_user_from_api_key)) -> Me:
+    """Account summary for the presented API key (used by the CLI)."""
+    return Me(email=user.email, plan=user.plan)
 
 
 @router.post("/api-keys", status_code=status.HTTP_201_CREATED, response_model=ApiKeyCreated)
