@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -62,6 +63,28 @@ class OpenRouterClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
+    @staticmethod
+    def _describe(exc: Exception) -> str:
+        return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+    async def _post_with_retry(self, payload: dict[str, Any], http_timeout: httpx.Timeout) -> httpx.Response:
+        attempts = 2
+        last_exc: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._http.post("/chat/completions", json=payload, timeout=http_timeout)
+            except httpx.TimeoutException as exc:
+                raise OpenRouterTimeoutError(f"OpenRouter request timed out after {http_timeout.read}s") from exc
+            except httpx.TransportError as exc:
+                last_exc = exc
+                if attempt == attempts:
+                    break
+                logger.warning("transient OpenRouter transport error (%s); retrying", self._describe(exc))
+                await asyncio.sleep(0.5 * attempt)
+        raise OpenRouterError(
+            f"OpenRouter request failed after {attempts} attempts ({self._describe(last_exc)})"
+        ) from last_exc
+
     async def chat_completion(
         self,
         *,
@@ -76,12 +99,7 @@ class OpenRouterClient:
         effective_timeout = timeout or self._settings.openrouter_timeout_seconds
         http_timeout = httpx.Timeout(effective_timeout, connect=10.0)
         started = time.monotonic()
-        try:
-            response = await self._http.post("/chat/completions", json=payload, timeout=http_timeout)
-        except httpx.TimeoutException as exc:
-            raise OpenRouterTimeoutError(f"OpenRouter request timed out after {effective_timeout}s") from exc
-        except httpx.HTTPError as exc:
-            raise OpenRouterError(f"OpenRouter request failed: {exc}") from exc
+        response = await self._post_with_retry(payload, http_timeout)
         if response.status_code != 200:
             raise OpenRouterError(f"OpenRouter returned HTTP {response.status_code}: {response.text[:500]}")
         try:
