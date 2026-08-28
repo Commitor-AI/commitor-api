@@ -82,6 +82,30 @@ _MESSAGE_QUALITY_FOLLOW_UP = (
     "components. Keep the same grouping. Respond with the same JSON format."
 )
 
+_BRANCH_SYSTEM_PROMPT = (
+    "You suggest a concise, descriptive git branch name for the changes in a diff. "
+    "Read the diff and produce a short kebab-case branch name: lowercase words joined by "
+    "hyphens, no spaces, no backticks, no explanation. Prefer a conventional-commit-style "
+    "prefix when it fits the primary change (feat-, fix-, refactor-, chore-, docs-, test-, "
+    "perf-, style-, ci-, build-). Keep it under 40 characters and focused on the single main "
+    "intent of the change. Respond with a single JSON object and nothing else:\n"
+    '{"branch_name": "kebab-case-name"}'
+)
+
+_BRANCH_CHARS_RE = re.compile(r"[^a-z0-9/-]+")
+
+
+def _clean_branch_name(raw: object) -> str | None:
+    """Coerce a model branch name into a safe, git-friendly slug."""
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().lower().strip("`").strip()
+    s = _BRANCH_CHARS_RE.sub("-", s)
+    s = re.sub(r"[-/]{2,}", "-", s).strip("-/")
+    if not s or len(s) > 60:
+        return None
+    return s[:60]
+
 # A subject made purely of these verbs/filler words says nothing about
 # the diff. Matched against the subject with any conventional-commit
 # prefix stripped, lowercased.
@@ -214,6 +238,10 @@ def _is_large(diff: str, files: list[str], settings: Settings) -> bool:
 
 
 def _heuristic_pass(payload: AnalyzeRequest, settings: Settings) -> tuple[AnalyzeResponse | None, list[str]]:
+    # Commit requests always pay for a real message; the deterministic
+    # tier is only good enough for scan's preview line.
+    if payload.mode == "commit":
+        return None, _extract_files(payload.diff)
     files = _extract_files(payload.diff)
     if not files or _is_large(payload.diff, files, settings):
         return None, files
@@ -231,6 +259,27 @@ def _parse_groups(result: ChatResult) -> tuple[list[ChangeGroup], float]:
     groups = [ChangeGroup.model_validate(item) for item in raw_groups]
     confidence = float(result.content.get("confidence", 0.0))
     return groups, max(0.0, min(1.0, confidence))
+
+
+async def _suggest_branch_name(diff: str, settings: Settings) -> str | None:
+    """One focused fast-model call that returns a kebab-case branch name."""
+    client = get_openrouter_client()
+    user_prompt = diff if len(diff) <= 200_000 else diff[:200_000]
+    try:
+        result = await client.chat_completion(
+            model=settings.openrouter_model,
+            messages=[
+                {"role": "system", "content": _BRANCH_SYSTEM_PROMPT},
+                {"role": "user", "content": "Diff:\n" + user_prompt},
+            ],
+        )
+        raw = result.content.get("branch_name") if isinstance(result.content, dict) else None
+        if not raw:
+            raw = result.raw_content
+        return _clean_branch_name(raw)
+    except (OpenRouterError, ValueError) as exc:
+        logger.warning("branch name suggestion failed (%s)", exc)
+        return None
 
 
 async def _rewrite_generic_messages(
@@ -260,6 +309,17 @@ async def _rewrite_generic_messages(
 async def analyze_diff(payload: AnalyzeRequest, settings: Settings | None = None) -> AnalyzeResponse:
     settings = settings or get_settings()
     started = time.monotonic()
+
+    # "branch" mode only needs a single focused call that returns a
+    # suggested branch name — no grouping, no escalation chain.
+    if payload.mode == "branch":
+        name = await _suggest_branch_name(payload.diff, settings)
+        return AnalyzeResponse(
+            groups=[],
+            confidence=1.0,
+            model_tier=ModelTier.fast,
+            branch_name=name,
+        )
 
     local_response, files = _heuristic_pass(payload, settings)
     if local_response is not None:
@@ -318,13 +378,22 @@ async def analyze_diff(payload: AnalyzeRequest, settings: Settings | None = None
         groups, confidence = _parse_groups(reasoning_result)
         history = [assistant_message(reasoning_result.raw_content, reasoning_result.reasoning_details)]
 
+        recheck = None
         if confidence < 0.9:
-            recheck = await client.chat_completion_with_reasoning(
-                system_prompt=_REASONING_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                history=history,
-                follow_up=_RECHECK_FOLLOW_UP,
-            )
+            if time.monotonic() - started < settings.analyze_chain_deadline_seconds:
+                recheck = await client.chat_completion_with_reasoning(
+                    system_prompt=_REASONING_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    history=history,
+                    follow_up=_RECHECK_FOLLOW_UP,
+                )
+            else:
+                logger.info(
+                    "skipping reasoning recheck turn (chain deadline %.0fs exceeded at %.1fs)",
+                    settings.analyze_chain_deadline_seconds,
+                    time.monotonic() - started,
+                )
+        if recheck is not None:
             try:
                 revised_groups, revised_confidence = _parse_groups(recheck)
                 groups, confidence = revised_groups, revised_confidence
@@ -335,7 +404,7 @@ async def analyze_diff(payload: AnalyzeRequest, settings: Settings | None = None
 
         # Same bounded quality net for the reasoning tier: one extra
         # turn asking for concrete messages; never fails the request.
-        if _generic_messages(groups):
+        if _generic_messages(groups) and time.monotonic() - started < settings.analyze_chain_deadline_seconds:
             logger.warning(
                 "reasoning model returned vague commit message(s) %s — requesting rewrite",
                 _generic_messages(groups),
