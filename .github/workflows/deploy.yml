@@ -1,39 +1,35 @@
-name: Deploy to Hugging Face Spaces
+name: Deploy to Vercel
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Push to HF Space
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel Environment Information
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          SPACE_ID: ${{ secrets.SPACE_ID }}
-        run: |
-          git config --global user.email "ci@commitor.ai"
-          git config --global user.name "commitor-ci"
-          git clone "https://oauth2:${HF_TOKEN}@huggingface.co/spaces/${SPACE_ID}" hf_space
-          rsync -av --exclude='.git' \
-                    --exclude='.venv' \
-                    --exclude='venv' \
-                    --exclude='commitor.db' \
-                    --exclude='.env' \
-                    --exclude='__pycache__' \
-                    ./ hf_space/
-          cd hf_space
-          git add -A
-          if git diff --cached --quiet; then
-            echo "No changes to deploy"
-          else
-            git commit -m "Deploy from GitHub ${GITHUB_SHA}"
-            git push
-          fi
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Build Project Artifacts
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Deploy Project Artifacts to Vercel
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
