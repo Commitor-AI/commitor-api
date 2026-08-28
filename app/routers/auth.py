@@ -74,6 +74,35 @@ async def create_api_key(
     return ApiKeyCreated(id=api_key.id, label=api_key.label, api_key=raw_key, created_at=api_key.created_at)
 
 
+@router.post("/cli/connect", status_code=status.HTTP_201_CREATED, response_model=ApiKeyCreated)
+async def cli_connect(
+    user: User = Depends(get_current_user_from_jwt),
+    db: AsyncSession = Depends(get_db),
+) -> ApiKeyCreated:
+    """One-shot CLI login: revoke any previous CLI keys, issue a fresh one.
+
+    Used by the web login page after the user authenticates from a
+    `commitor login` browser flow; the returned key is handed back to the
+    CLI via its local redirect callback.
+    """
+    result = await db.execute(
+        select(ApiKey).where(ApiKey.user_id == user.id, ApiKey.label == "Commitor CLI")
+    )
+    now = datetime.now(timezone.utc)
+    for existing in result.scalars():
+        if existing.revoked_at is None:
+            existing.revoked_at = now
+
+    raw_key = generate_api_key()
+    api_key = ApiKey(user_id=user.id, key_hash=hash_api_key(raw_key), label="Commitor CLI")
+    db.add(api_key)
+    await db.commit()
+    await db.refresh(api_key)
+    return ApiKeyCreated(
+        id=api_key.id, label=api_key.label, api_key=raw_key, created_at=api_key.created_at
+    )
+
+
 @router.get("/api-keys", response_model=list[ApiKeyRead])
 async def list_api_keys(
     user: User = Depends(get_current_user_from_jwt),
