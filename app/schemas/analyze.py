@@ -12,6 +12,10 @@ class ModelTier(str, Enum):
 class AnalyzeRequest(BaseModel):
     diff: str = Field(min_length=1, max_length=200_000)
     context: str | None = Field(default=None, max_length=4_000)
+    # "commit" requests always get model-generated messages; the free
+    # deterministic local tier is reserved for scan previews. "branch"
+    # returns only an AI-suggested branch name for the diff.
+    mode: str = Field(default="scan", pattern="^(scan|commit|branch)$")
 
 
 class PartialFile(BaseModel):
@@ -39,3 +43,6 @@ class AnalyzeResponse(BaseModel):
     groups: list[ChangeGroup]
     confidence: float = Field(ge=0.0, le=1.0)
     model_tier: ModelTier
+    # AI-suggested kebab-case branch name (populated for mode="branch",
+    # absent otherwise). CLI uses it to pre-fill `commitor commit -b`.
+    branch_name: str | None = None
