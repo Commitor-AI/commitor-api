@@ -20,7 +20,9 @@ def database_url() -> str:
     env_path = Path.cwd() / ".env"
     values = dotenv_values(env_path) if env_path.exists() else {}
     url = os.getenv("DATABASE_URL") or values.get("DATABASE_URL") or "sqlite+aiosqlite:///./commitor.db"
-    return url.replace("+asyncpg", "+psycopg2").replace("+aiosqlite", "")
+    url = url.replace("+asyncpg", "+psycopg2").replace("+aiosqlite", "")
+    # asyncpg uses `ssl=`, but psycopg2/sync driver expects `sslmode=`
+    return url.replace("ssl=", "sslmode=")
 
 
 def run_migrations_offline() -> None:
