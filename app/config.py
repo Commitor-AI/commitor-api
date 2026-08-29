@@ -27,6 +27,15 @@ class Settings(BaseSettings):
     analyze_escalation_diff_lines: int = 300
     analyze_confidence_threshold: float = 0.7
 
+    # Comma-separated list of emails that the backend trusts as verified
+    # admins. Membership here is the *source of truth* for admin status —
+    # the CLI's `gimme admin` flow only succeeds for these accounts.
+    admin_emails: str = ""
+
+    def is_admin_email(self, email: str) -> bool:
+        wanted = {e.strip().lower() for e in self.admin_emails.split(",") if e.strip()}
+        return email.strip().lower() in wanted
+
 
 @lru_cache
 def get_settings() -> Settings:
