@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.database import engine
-from app.rate_limit import RateLimitExceeded
+from app.rate_limit import DiffTooLarge, RateLimitExceeded
 from app.routers.analyze import router as analyze_router
 from app.routers.auth import router as auth_router
 
@@ -32,6 +32,11 @@ app.include_router(analyze_router, prefix="/analyze", tags=["analyze"])
 @app.exception_handler(RateLimitExceeded)
 async def rate_limit_exceeded_handler(_: Request, exc: RateLimitExceeded) -> JSONResponse:
     return JSONResponse(status_code=429, content=exc.body, headers=exc.headers)
+
+
+@app.exception_handler(DiffTooLarge)
+async def diff_too_large_handler(_: Request, exc: DiffTooLarge) -> JSONResponse:
+    return JSONResponse(status_code=413, content=exc.body)
 
 
 @app.get("/health")

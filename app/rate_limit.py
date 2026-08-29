@@ -120,6 +120,42 @@ def analyze_daily_limit(plan: Plan) -> int:
     return PLAN_ANALYZE_DAILY_LIMIT.get(plan, PLAN_ANALYZE_DAILY_LIMIT[Plan.free])
 
 
+# --- Plan-gated diff size for AI endpoints ---------------------------------
+
+# Absolute ceiling the wire schema accepts; the per-plan limit below is the
+# real gate. Free stays at 200k (the CLI caps slightly under this); Pro gets
+# far more headroom. Raise the schema ceiling if PRO ever grows past it.
+PLAN_ANALYZE_MAX_DIFF_CHARS: dict[Plan, int] = {
+    Plan.free: 200_000,
+    Plan.pro: 1_000_000,
+}
+
+PRICING_URL = "https://commitor.dev/pricing"
+
+
+def analyze_max_diff_chars(plan: Plan) -> int:
+    # Unknown future plan values fall back to the free tier.
+    return PLAN_ANALYZE_MAX_DIFF_CHARS.get(plan, PLAN_ANALYZE_MAX_DIFF_CHARS[Plan.free])
+
+
+class DiffTooLarge(Exception):
+    """413 — the diff exceeds the caller's plan limit (upgrade to analyze bigger)."""
+
+    def __init__(self, limit: int, plan: Plan = Plan.free) -> None:
+        message = (
+            f"This change is too large to analyze on the {plan.value} plan "
+            f"(limit {limit:,} characters). Upgrade to Pro at {PRICING_URL} "
+            f"to analyze changes this large."
+        )
+        self.body = {
+            "error": "diff_too_large",
+            "message": message,
+            "limit": limit,
+            "upgrade_url": PRICING_URL,
+        }
+        super().__init__(message)
+
+
 class RateLimitExceeded(Exception):
     def __init__(self, decision: LimitDecision, message: str) -> None:
         self.decision = decision
