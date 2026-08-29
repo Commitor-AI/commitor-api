@@ -10,7 +10,9 @@ class ModelTier(str, Enum):
 
 
 class AnalyzeRequest(BaseModel):
-    diff: str = Field(min_length=1, max_length=200_000)
+    # Absolute wire ceiling only — the real Free/Pro limit is enforced in
+    # the router (see `analyze_max_diff_chars`). Keep this >= the Pro limit.
+    diff: str = Field(min_length=1, max_length=1_000_000)
     context: str | None = Field(default=None, max_length=4_000)
     # "commit" requests always get model-generated messages; the free
     # deterministic local tier is reserved for scan previews. "branch"

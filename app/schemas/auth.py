@@ -30,3 +30,4 @@ class Me(BaseModel):
 
     email: EmailStr
     plan: Plan
+    admin: bool = Field(description="Whether the backend verifies this account as an admin.")

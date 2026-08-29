@@ -7,7 +7,13 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from app.config import Settings, get_settings
-from app.schemas.analyze import AnalyzeRequest, AnalyzeResponse, ChangeGroup, ModelTier
+from app.schemas.analyze import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    ChangeGroup,
+    ModelTier,
+    PartialFile,
+)
 from app.services.openrouter import (
     ChatResult,
     OpenRouterError,
@@ -22,6 +28,14 @@ _JSON_INSTRUCTION = (
     '{"groups": [{"files": ["path"], "partial_files": [{"path": "path", "hunks": [1]}], '
     '"commit_message": "commit message", '
     '"rationale": "why these changes belong together"}], "confidence": 0.0-1.0}\n'
+    "Rules for paths:\n"
+    "- Every path in `files` and `partial_files` MUST be the EXACT full path as it "
+    "appears in the diff (the text after `diff --git a/… b/`), including any "
+    "`crates/`, `src/`, or directory prefixes. Never shorten a path to its basename "
+    "or a repo-relative form.\n"
+    "- A path not present verbatim in the diff will be rejected; double-check the "
+    "prefixes against the diff before answering.\n"
+    "\n"
     "Rules for splitting inside a single file:\n"
     "- Hunks are numbered 1-based per file, in the order they appear in the diff.\n"
     "- To assign only part of a file to a group, list the file in that group's "
@@ -186,51 +200,385 @@ def _diff_line_count(diff: str) -> int:
     return sum(1 for line in diff.splitlines() if line.startswith(("+", "-")) and not line.startswith(("+++", "---")))
 
 
-def _local_commit_message(diff: str, top: str) -> str:
-    """Deterministic fallback message naming the actual files touched.
+def _categorize(path: str) -> str:
+    """Mirror the CLI's file categorization used for conventional typing."""
+    lower = path.lower()
+    name = lower.rsplit("/", 1)[-1]
+    if (
+        "/tests/" in lower
+        or "/test/" in lower
+        or "__tests__" in lower
+        or name.startswith("test_")
+        or name.endswith("_test.rs")
+        or name.endswith("_test.py")
+        or name.endswith(".test.ts")
+        or name.endswith(".test.js")
+        or name.endswith("_spec.rs")
+        or name.endswith("_spec.py")
+    ):
+        return "test"
+    if (
+        name.endswith(".md")
+        or name.endswith(".rst")
+        or "/docs/" in lower
+        or name.startswith("readme")
+        or name.startswith("changelog")
+        or name.startswith("license")
+    ):
+        return "docs"
+    build_names = {
+        "cargo.toml",
+        "cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "dockerfile",
+        "makefile",
+        "justfile",
+        "build.rs",
+        "requirements.txt",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "docker-compose.yml",
+        "composer.json",
+        "gemfile",
+        ".gitignore",
+    }
+    if (
+        name in build_names
+        or "/.github/" in lower
+        or "/.gitlab/" in lower
+        or lower.endswith(".tf")
+        or lower.endswith(".toml")
+        or lower.endswith(".yml")
+        or lower.endswith(".yaml")
+    ):
+        return "build"
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    source_exts = {
+        "rs",
+        "py",
+        "js",
+        "ts",
+        "jsx",
+        "tsx",
+        "go",
+        "java",
+        "c",
+        "h",
+        "cpp",
+        "hpp",
+        "cc",
+        "rb",
+        "php",
+        "swift",
+        "kt",
+        "scala",
+        "sh",
+        "sql",
+        "html",
+        "css",
+        "scss",
+        "sass",
+        "vue",
+        "elm",
+        "ex",
+        "exs",
+        "clj",
+        "lua",
+        "dart",
+    }
+    if ext in source_exts:
+        return "source"
+    return "other"
 
-    The local tier can't understand intent, but "update 3 files in src"
-    is strictly better than a bare "update src": each file gets an
-    add/remove/update verb derived from the diff headers.
-    """
-    actions: OrderedDict[str, str] = OrderedDict()
-    old_path: str | None = None
+
+def _parse_file_changes(diff: str) -> list[dict]:
+    """Reconstruct per-file change metadata from the patch (mirror of the CLI)."""
+    changes: list[dict] = []
+    current: dict | None = None
     for line in diff.splitlines():
-        if line.startswith("diff --git"):
-            old_path = None
-        elif line.startswith("--- "):
-            old_path = line[4:].strip()
-        elif line.startswith("+++ b/"):
-            new_path = line[6:].strip()
-            base = new_path.rsplit("/", 1)[-1] if new_path else "file"
-            old_is_dev_null = old_path in (None, "", "/dev/null")
-            action = f"add {base}" if old_is_dev_null else f"update {base}"
-            actions.setdefault(f"{new_path}:{action}", action)
-        elif line.startswith("+++ /dev/null"):
-            name = (old_path or "").removeprefix("a/").rsplit("/", 1)[-1] or "file"
-            actions.setdefault(f"del:{name}", f"remove {name}")
-    if not actions:
-        return f"chore({top}): update {top} files"
-    listed = list(actions.values())
-    summary = "; ".join(listed[:5])
-    if len(listed) > 5:
-        summary += f"; +{len(listed) - 5} more"
-    return f"chore({top}): {summary}"
+        if line.startswith("diff --git "):
+            if current is not None:
+                changes.append(current)
+            rest = line[len("diff --git ") :]
+            path = rest.split(" b/")[-1]
+            current = {"path": path, "kind": "modified", "added": 0, "removed": 0}
+        elif line.startswith("new file mode"):
+            if current is not None:
+                current["kind"] = "added"
+        elif line.startswith("deleted file mode"):
+            if current is not None:
+                current["kind"] = "deleted"
+        elif line.startswith("+") and not line.startswith("+++"):
+            if current is not None:
+                current["added"] += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            if current is not None:
+                current["removed"] += 1
+    if current is not None:
+        changes.append(current)
+    return changes
 
 
-def _group_by_top_level(files: list[str], diff: str) -> list[ChangeGroup]:
-    buckets: OrderedDict[str, list[str]] = OrderedDict()
-    for path in files:
-        top = path.split("/", 1)[0] if "/" in path else "(root)"
-        buckets.setdefault(top, []).append(path)
-    return [
-        ChangeGroup(
-            files=paths,
-            commit_message=_local_commit_message(diff, top),
-            rationale=f"All changed files live under '{top}'",
+def _classify_changes(changes: list[dict]) -> str:
+    """Conventional-Commits type, derived from the diff (mirror of the CLI)."""
+    cats = [_categorize(c["path"]) for c in changes]
+    if changes and all(c == "test" for c in cats):
+        return "test"
+    if changes and all(c == "docs" for c in cats):
+        return "docs"
+    if changes and all(c == "build" for c in cats):
+        return "build"
+
+    def code_like(cat: str) -> bool:
+        return cat in ("source", "other")
+
+    # New functionality: a new file, or code added to existing files.
+    if any(
+        c["kind"] in ("added", "modified")
+        and code_like(_categorize(c["path"]))
+        and c["added"] > 0
+        and c["removed"] == 0
+        for c in changes
+    ):
+        return "feat"
+
+    added = sum(c["added"] for c in changes)
+    removed = sum(c["removed"] for c in changes)
+    if len(changes) > 1 and removed > added and removed > 0:
+        return "refactor"
+    if removed > 0 or any(c["kind"] == "deleted" for c in changes):
+        return "fix"
+    return "refactor"
+
+
+def _subject_for(changes: list[dict]) -> str:
+    def code_like(cat: str) -> bool:
+        return cat in ("source", "other")
+
+    primary = next(
+        (c for c in changes if c["kind"] == "added" and code_like(_categorize(c["path"]))),
+        None,
+    ) or next((c for c in changes if code_like(_categorize(c["path"]))), None) or (
+        changes[0] if changes else None
+    )
+    if not primary:
+        return "update working changes"
+    verb = {"added": "add", "deleted": "remove", "modified": "update"}[primary["kind"]]
+    filename = primary["path"].rsplit("/", 1)[-1]
+    stem = filename.rsplit(".", 1)[0] or filename
+    n = len(changes)
+    if n == 1:
+        return f"{verb} {stem}"
+    return f"{verb} {stem} and {n - 1} more"
+
+
+def _conventional_local_message(diff: str, top: str, paths: list[str]) -> str:
+    """Deterministic conventional-commit message for the local tier.
+
+    Mirrors the CLI's offline generator so the local fallback reads like
+    `feat(auth): add login` instead of a flat `chore(...): add x; update y`.
+    """
+    all_changes = _parse_file_changes(diff)
+    path_set = set(paths)
+    changes = [c for c in all_changes if c["path"] in path_set]
+    if not changes:
+        return f"chore: update {top} files"
+    ctype = _classify_changes(changes)
+    subject = _subject_for(changes)
+    if top == "(root)":
+        return f"{ctype}: {subject}"
+    return f"{ctype}({top}): {subject}"
+
+
+def _parent_dir(path: str) -> str | None:
+    """Parent directory of a path, used as the per-file Conventional-Commits
+    scope (`None` for files at the repo root)."""
+    parts = path.split("/")
+    return "/".join(parts[:-1]) if len(parts) > 1 else None
+
+
+def _scope_for(path: str) -> str | None:
+    """Conventional-Commits scope with generic source roots stripped, so a
+    path like `crates/cli/src/auth.rs` yields `cli/auth` (not
+    `crates/cli/src/auth`) and a crate's top-level source file like
+    `crates/cli/src/main.rs` yields `cli` (not the uninformative `src`).
+    Mirrors the CLI's `scope_for`."""
+    parent = _parent_dir(path)
+    if not parent:
+        return None
+    return _trim_source_root(parent) or None
+
+
+def _trim_source_root(directory: str) -> str:
+    if directory.startswith("crates/"):
+        rest = directory[len("crates/"):]
+        crate, _, after = rest.partition("/")
+        if after == "src":
+            return crate
+        if after.startswith("src/"):
+            inner = after[len("src/"):]
+            return f"{crate}/{inner}" if inner else crate
+        if after:
+            return f"{crate}/{after}"
+        return crate
+    for root in ("src/", "lib/", "app/", "include/", "tests/", "test/"):
+        if directory.startswith(root):
+            return directory[len(root):]
+    return directory
+
+
+def _parse_file_hunks(diff: str) -> list[dict]:
+    """Per-file hunk breakdown with added/removed line counts, in diff order.
+
+    Used by the local tier to split a file's add-only hunks (a feature)
+    from its modified hunks (a fix) at hunk granularity.
+    """
+    files: list[dict] = []
+    current: dict | None = None
+    hunk: dict | None = None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            if current is not None:
+                files.append(current)
+            path = line[len("diff --git ") :].split(" b/")[-1]
+            current = {"path": path, "kind": "modified", "hunks": []}
+            hunk = None
+        elif line.startswith("new file mode"):
+            if current is not None:
+                current["kind"] = "added"
+        elif line.startswith("deleted file mode"):
+            if current is not None:
+                current["kind"] = "deleted"
+        elif line.startswith("@@"):
+            if current is None:
+                continue
+            hunk = {"index": len(current["hunks"]) + 1, "added": 0, "removed": 0}
+            current["hunks"].append(hunk)
+        elif line.startswith("+") and not line.startswith("+++"):
+            if hunk is not None:
+                hunk["added"] += 1
+        elif line.startswith("-") and not line.startswith("---"):
+            if hunk is not None:
+                hunk["removed"] += 1
+    if current is not None:
+        files.append(current)
+    return files
+
+
+def _file_segments(file_change: dict) -> list[tuple[str, bool, list[int] | None]]:
+    """One or more `(type, is_whole, hunk_ids)` segments for a file.
+
+    A modified file whose hunks split into add-only (feature) and
+    modified/deleted (fix) parts yields two hunk-level segments; every
+    other file stays whole.
+    """
+    hunks = file_change["hunks"]
+    kind = file_change["kind"]
+    if kind == "added":
+        return [("feat", True, None)]
+    if kind == "deleted":
+        return [("fix", True, None)]
+    add_only = [h["index"] for h in hunks if h["added"] > 0 and h["removed"] == 0]
+    others = [h["index"] for h in hunks if not (h["added"] > 0 and h["removed"] == 0)]
+    if add_only and others:
+        return [("feat", False, add_only), ("fix", False, others)]
+    if add_only:
+        return [("feat", True, None)]
+    if others:
+        return [("fix", True, None)]
+    return [("chore", True, None)]
+
+
+def _subject_for_paths(paths: list[str], ctype: str) -> str:
+    """Imperative subject derived from file stems (mirror of the CLI)."""
+    if not paths:
+        return "update working changes"
+
+    def code_like(cat: str) -> bool:
+        return cat in ("source", "other")
+
+    primary = next((p for p in paths if code_like(_categorize(p))), paths[0])
+    verb = {
+        "feat": "add",
+        "fix": "update",
+        "refactor": "refactor",
+        "docs": "update",
+        "test": "add",
+        "build": "update",
+        "chore": "update",
+    }.get(ctype, "update")
+    filename = primary.rsplit("/", 1)[-1]
+    stem = filename.rsplit(".", 1)[0] or filename
+    n = len(paths)
+    if n == 1:
+        return f"{verb} {stem}"
+    return f"{verb} {stem} and {n - 1} more"
+
+
+def _split_by_type_scope(diff: str, files: list[str]) -> list[ChangeGroup]:
+    """Split a diff into one commit per `(type, scope)`, at hunk granularity
+    where a single file mixes feature additions with fixes. Mirrors the
+    CLI's `offline_groups` and extends it with hunk-level splitting.
+
+    - distinct features, distinct fixes, and the remainder each get their
+      own commit,
+    - a modified file with both add-only hunks and modified hunks is split
+      so the additions commit as `feat` and the edits as `fix`.
+    """
+    parsed = _parse_file_hunks(diff)
+    path_set = set(files)
+    parsed = [f for f in parsed if f["path"] in path_set]
+    if not parsed:
+        return [
+            ChangeGroup(
+                files=list(files),
+                commit_message=_conventional_local_message(diff, "(root)", list(files)),
+                rationale="All changed files",
+            )
+        ]
+
+    buckets: dict[tuple[str, str | None], dict] = {}
+    order: list[tuple[str, str | None]] = []
+    for f in parsed:
+        scope = _scope_for(f["path"])
+        for ctype, is_whole, hunk_ids in _file_segments(f):
+            key = (ctype, scope)
+            if key not in buckets:
+                buckets[key] = {"files": [], "partial": []}
+                order.append(key)
+            if is_whole:
+                if f["path"] not in buckets[key]["files"]:
+                    buckets[key]["files"].append(f["path"])
+            else:
+                buckets[key]["partial"].append({"path": f["path"], "hunks": hunk_ids})
+
+    groups: list[ChangeGroup] = []
+    for key in order:
+        ctype, scope = key
+        bucket = buckets[key]
+        top = scope if scope else "(root)"
+        subject_paths = list(bucket["files"]) + [p["path"] for p in bucket["partial"]]
+        if bucket["partial"]:
+            subject = _subject_for_paths(subject_paths, ctype)
+            prefix = f"{ctype}({scope})" if scope else ctype
+            message = f"{prefix}: {subject}"
+        else:
+            message = _conventional_local_message(diff, top, bucket["files"])
+        partial_files = [PartialFile(path=p["path"], hunks=p["hunks"]) for p in bucket["partial"]]
+        rationale = f"Changes classified as {ctype}" + (f" under '{scope}'" if scope else "")
+        groups.append(
+            ChangeGroup(
+                files=bucket["files"],
+                commit_message=message,
+                rationale=rationale,
+                partial_files=partial_files,
+            )
         )
-        for top, paths in buckets.items()
-    ]
+    return groups
 
 
 def _is_large(diff: str, files: list[str], settings: Settings) -> bool:
@@ -245,11 +593,9 @@ def _heuristic_pass(payload: AnalyzeRequest, settings: Settings) -> tuple[Analyz
     files = _extract_files(payload.diff)
     if not files or _is_large(payload.diff, files, settings):
         return None, files
-    groups = _group_by_top_level(files, payload.diff)
-    if len(groups) == 1:
-        response = AnalyzeResponse(groups=groups, confidence=0.8, model_tier=ModelTier.local)
-        return response, files
-    return None, files
+    groups = _split_by_type_scope(payload.diff, files)
+    response = AnalyzeResponse(groups=groups, confidence=0.8, model_tier=ModelTier.local)
+    return response, files
 
 
 def _parse_groups(result: ChatResult) -> tuple[list[ChangeGroup], float]:
