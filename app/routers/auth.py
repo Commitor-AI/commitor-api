@@ -6,8 +6,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
-from app.dependencies.auth import get_current_user_from_api_key, get_current_user_from_jwt
+from app.dependencies.auth import (
+    get_current_user_either,
+    get_current_user_from_api_key,
+    get_current_user_from_jwt,
+)
 from app.models.api_key import ApiKey
 from app.models.user import User
 from app.rate_limit import login_limiter, rate_limit_dependency, signup_limiter
@@ -18,6 +23,20 @@ from app.security.jwt_handler import create_access_token
 from app.security.passwords import hash_password, verify_password
 
 router = APIRouter()
+
+
+def _sync_admin_flag(user: User, email: str) -> bool:
+    """Keep `is_admin` in sync with the configured allowlist.
+
+    Returns True when the flag changed so the caller can commit. The
+    allowlist in settings is the single source of truth for who counts
+    as a verified admin — the value is never taken from the client.
+    """
+    is_admin = get_settings().is_admin_email(email)
+    if user.is_admin != is_admin:
+        user.is_admin = is_admin
+        return True
+    return False
 
 
 @router.post(
@@ -32,6 +51,7 @@ async def signup(payload: UserCreate, db: AsyncSession = Depends(get_db)) -> Tok
     if existing_user is not None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
     user = User(email=email, hashed_password=hash_password(payload.password))
+    user.is_admin = get_settings().is_admin_email(email)
     db.add(user)
     try:
         await db.commit()
@@ -51,13 +71,17 @@ async def login(payload: UserCreate, db: AsyncSession = Depends(get_db)) -> Toke
     user = await db.scalar(select(User).where(User.email == email))
     if user is None or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+    if _sync_admin_flag(user, email):
+        await db.commit()
     return Token(access_token=create_access_token(user.id, user.plan))
 
 
 @router.get("/me", response_model=Me)
-async def me(user: User = Depends(get_current_user_from_api_key)) -> Me:
-    """Account summary for the presented API key (used by the CLI)."""
-    return Me(email=user.email, plan=user.plan)
+async def me(user: User = Depends(get_current_user_either)) -> Me:
+    """Account summary behind a presented credential — used by both the
+    CLI (`whoami`, API key) and the web dashboard (session JWT), so they
+    show identical plan and admin status."""
+    return Me(email=user.email, plan=user.plan, admin=user.is_admin)
 
 
 @router.post("/api-keys", status_code=status.HTTP_201_CREATED, response_model=ApiKeyCreated)

@@ -87,3 +87,31 @@ async def get_current_user_from_api_key(
             headers=_WWW_AUTHENTICATE,
         )
     return user
+
+
+async def get_current_user_either(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    """Accept either a CLI API key or a web session JWT, so the same
+    `/auth/me` account summary backs both the CLI (`whoami`) and the web
+    dashboard. API key wins (it's the CLI path); on failure we fall
+    through to the session JWT."""
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated: missing bearer token",
+            headers=_WWW_AUTHENTICATE,
+        )
+    try:
+        return await get_current_user_from_api_key(credentials, db)
+    except HTTPException:
+        pass
+    try:
+        return await get_current_user_from_jwt(credentials, db)
+    except HTTPException:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers=_WWW_AUTHENTICATE,
+        )
