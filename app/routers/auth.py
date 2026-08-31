@@ -17,7 +17,15 @@ from app.models.api_key import ApiKey
 from app.models.user import User
 from app.rate_limit import login_limiter, rate_limit_dependency, signup_limiter
 from app.schemas.api_key import ApiKeyCreate, ApiKeyCreated, ApiKeyRead
-from app.schemas.auth import Me, Token, UserCreate
+from app.schemas.auth import (
+    GithubAuthorizeRequest,
+    GithubAuthorizeResponse,
+    GithubLoginsRead,
+    GithubLoginsUpdate,
+    Me,
+    Token,
+    UserCreate,
+)
 from app.security.api_keys import generate_api_key, hash_api_key
 from app.security.jwt_handler import create_access_token
 from app.security.passwords import hash_password, verify_password
@@ -89,6 +97,46 @@ async def me(
     if _sync_admin_flag(user, user.email):
         await db.commit()
     return Me(email=user.email, plan=user.plan, admin=user.is_admin)
+
+
+@router.post("/github/authorize", response_model=GithubAuthorizeResponse)
+async def github_authorize(
+    payload: GithubAuthorizeRequest,
+    user: User = Depends(get_current_user_from_api_key),
+) -> GithubAuthorizeResponse:
+    """The Commitor GitHub App asks, with the account's stored API key,
+    whether a given GitHub sender may run an analysis under this key. The
+    allowlist lives on the account (`users.github_logins`) so the owner
+    manages it from the dashboard rather than in bot config."""
+    return GithubAuthorizeResponse(
+        authorized=user.allows_github_login(payload.login),
+        email=user.email,
+        plan=user.plan,
+    )
+
+
+@router.get("/github/logins", response_model=GithubLoginsRead)
+async def get_github_logins(
+    user: User = Depends(get_current_user_from_jwt),
+) -> GithubLoginsRead:
+    """Read the account's GitHub-app allowlist (session-authenticated)."""
+    return GithubLoginsRead(logins=list(user.github_logins or []))
+
+
+@router.put("/github/logins", response_model=GithubLoginsRead)
+async def set_github_logins(
+    payload: GithubLoginsUpdate,
+    user: User = Depends(get_current_user_from_jwt),
+    db: AsyncSession = Depends(get_db),
+) -> GithubLoginsRead:
+    """Replace the account's GitHub-app allowlist. Normalized to lowercase
+    so lookups are case-insensitive."""
+    user.github_logins = list(
+        {login.strip().lower() for login in payload.logins if login.strip()}
+    )
+    await db.commit()
+    await db.refresh(user)
+    return GithubLoginsRead(logins=list(user.github_logins))
 
 
 @router.post("/api-keys", status_code=status.HTTP_201_CREATED, response_model=ApiKeyCreated)
