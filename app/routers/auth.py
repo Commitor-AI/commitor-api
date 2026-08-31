@@ -77,10 +77,17 @@ async def login(payload: UserCreate, db: AsyncSession = Depends(get_db)) -> Toke
 
 
 @router.get("/me", response_model=Me)
-async def me(user: User = Depends(get_current_user_either)) -> Me:
+async def me(
+    user: User = Depends(get_current_user_either),
+    db: AsyncSession = Depends(get_db),
+) -> Me:
     """Account summary behind a presented credential — used by both the
     CLI (`whoami`, API key) and the web dashboard (session JWT), so they
-    show identical plan and admin status."""
+    show identical plan and admin status. The admin flag is re-verified
+    against the allowlist on every read, so granting admin via
+    `ADMIN_EMAILS` takes effect immediately without requiring a re-login."""
+    if _sync_admin_flag(user, user.email):
+        await db.commit()
     return Me(email=user.email, plan=user.plan, admin=user.is_admin)
 
 

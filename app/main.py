@@ -9,6 +9,7 @@ from app.database import engine
 from app.rate_limit import DiffTooLarge, RateLimitExceeded
 from app.routers.analyze import router as analyze_router
 from app.routers.auth import router as auth_router
+from app.routers.review import router as review_router
 
 
 @asynccontextmanager
@@ -27,6 +28,7 @@ app.add_middleware(
 )
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(analyze_router, prefix="/analyze", tags=["analyze"])
+app.include_router(review_router, prefix="/review", tags=["review"])
 
 
 @app.exception_handler(RateLimitExceeded)
