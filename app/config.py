@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     analyze_escalation_diff_lines: int = 300
     analyze_confidence_threshold: float = 0.7
 
+    # PR review — max hunks the /review endpoint will process per request.
+    # Hunks beyond this cap are dropped with truncated=true in the response.
+    max_hunks_per_review: int = 60
+
     # Comma-separated list of emails that the backend trusts as verified
     # admins. Membership here is the *source of truth* for admin status —
     # the CLI's `gimme admin` flow only succeeds for these accounts.
