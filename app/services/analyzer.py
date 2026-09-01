@@ -96,6 +96,13 @@ _MESSAGE_QUALITY_FOLLOW_UP = (
     "components. Keep the same grouping. Respond with the same JSON format."
 )
 
+_PARTITION_FIX_FOLLOW_UP = (
+    "Your proposed grouping has invalid file assignments: {error}. "
+    "Every changed file and hunk must belong to EXACTLY ONE group with no duplicates and no gaps. "
+    "Revise the groups so each file and hunk is accounted for exactly once. "
+    "Respond with the same JSON format."
+)
+
 _BRANCH_SYSTEM_PROMPT = (
     "You suggest a concise, descriptive git branch name for the changes in a diff. "
     "Read the diff and produce a short kebab-case branch name: lowercase words joined by "
@@ -189,9 +196,14 @@ def _generic_messages(groups: list[ChangeGroup]) -> list[str]:
 def _extract_files(diff: str) -> list[str]:
     files: list[str] = []
     for line in diff.splitlines():
-        if line.startswith("+++ b/"):
-            path = line[len("+++ b/") :]
-            if path not in files:
+        if line.startswith("diff --git "):
+            rest = line[len("diff --git ") :]
+            path = rest.split(" b/")[-1].strip()
+            if path and path not in files:
+                files.append(path)
+        elif line.startswith("+++ b/"):
+            path = line[len("+++ b/") :].strip()
+            if path and path not in files:
                 files.append(path)
     return files
 
@@ -607,6 +619,47 @@ def _parse_groups(result: ChatResult) -> tuple[list[ChangeGroup], float]:
     return groups, max(0.0, min(1.0, confidence))
 
 
+def _validate_partition(groups: list[ChangeGroup], files: list[str]) -> str | None:
+    """Validate that groups partition the changed files without duplicates or omissions.
+
+    Returns an error description string if invalid, or None if valid.
+    """
+    if not groups:
+        return "no groups returned"
+
+    claimed_whole: set[str] = set()
+    claimed_partial: dict[str, set[int]] = {}
+
+    for i, group in enumerate(groups, 1):
+        if not group.files and not group.partial_files:
+            return f"group {i} has no files or hunks assigned"
+
+        for path in group.files:
+            if path in claimed_whole:
+                return f"'{path}' is assigned whole to more than one group"
+            if path in claimed_partial:
+                return f"'{path}' is claimed both whole and partially"
+            claimed_whole.add(path)
+
+        for partial in group.partial_files:
+            if partial.path in claimed_whole:
+                return f"'{partial.path}' is claimed both whole and partially"
+            claimed_hunks = claimed_partial.setdefault(partial.path, set())
+            for h in partial.hunks:
+                if h in claimed_hunks:
+                    return f"'{partial.path}' hunk {h} is assigned more than once"
+                claimed_hunks.add(h)
+
+    # Check coverage against expected files
+    if files:
+        file_set = set(files)
+        for path in file_set:
+            if path not in claimed_whole and path not in claimed_partial:
+                return f"'{path}' is not included in any group"
+
+    return None
+
+
 async def _suggest_branch_name(diff: str, settings: Settings) -> str | None:
     """One focused fast-model call that returns a kebab-case branch name."""
     client = get_openrouter_client()
@@ -691,7 +744,10 @@ async def analyze_diff(payload: AnalyzeRequest, settings: Settings | None = None
             ],
         )
         groups, confidence = _parse_groups(fast_result)
-        if confidence >= settings.analyze_confidence_threshold:
+        partition_err = _validate_partition(groups, files)
+        if partition_err:
+            logger.warning("fast model produced invalid partition (%s), escalating to reasoning model", partition_err)
+        elif confidence >= settings.analyze_confidence_threshold:
             groups = await _rewrite_generic_messages(
                 client,
                 settings.openrouter_model,
@@ -723,6 +779,33 @@ async def analyze_diff(payload: AnalyzeRequest, settings: Settings | None = None
         )
         groups, confidence = _parse_groups(reasoning_result)
         history = [assistant_message(reasoning_result.raw_content, reasoning_result.reasoning_details)]
+
+        partition_err = _validate_partition(groups, files)
+        if partition_err and time.monotonic() - started < settings.analyze_chain_deadline_seconds:
+            logger.warning(
+                "reasoning model produced invalid partition (%s) — requesting correction turn",
+                partition_err,
+            )
+            try:
+                repair = await client.chat_completion_with_reasoning(
+                    system_prompt=_REASONING_SYSTEM_PROMPT,
+                    user_prompt=user_prompt,
+                    history=history,
+                    follow_up=_PARTITION_FIX_FOLLOW_UP.format(error=partition_err),
+                )
+                repaired_groups, repaired_confidence = _parse_groups(repair)
+                repaired_err = _validate_partition(repaired_groups, files)
+                if not repaired_err:
+                    groups, confidence = repaired_groups, repaired_confidence
+                    history.append(assistant_message(repair.raw_content, repair.reasoning_details))
+                    reasoning_result = repair
+                else:
+                    logger.warning(
+                        "repaired reasoning partition still invalid (%s); keeping best effort",
+                        repaired_err,
+                    )
+            except (OpenRouterError, ValueError) as exc:
+                logger.warning("partition correction turn failed (%s)", exc)
 
         recheck = None
         if confidence < 0.9:
