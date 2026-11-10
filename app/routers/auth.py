@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -96,7 +97,13 @@ async def me(
     `ADMIN_EMAILS` takes effect immediately without requiring a re-login."""
     if _sync_admin_flag(user, user.email):
         await db.commit()
-    return Me(email=user.email, plan=user.plan, admin=user.is_admin)
+    return Me(
+        email=user.email,
+        plan=user.plan,
+        admin=user.is_admin,
+        strict=user.strict,
+        enable_pr_review=user.enable_pr_review,
+    )
 
 
 @router.post("/github/authorize", response_model=GithubAuthorizeResponse)
@@ -137,6 +144,49 @@ async def set_github_logins(
     await db.commit()
     await db.refresh(user)
     return GithubLoginsRead(logins=list(user.github_logins))
+
+
+class PreferencesUpdate(BaseModel):
+    """Update the account's PR review preferences."""
+
+    strict: bool | None = None
+    enable_pr_review: bool | None = None
+
+
+class PreferencesRead(BaseModel):
+    strict: bool
+    enable_pr_review: bool
+
+
+@router.get("/auth/preferences", response_model=PreferencesRead)
+async def get_preferences(
+    user: User = Depends(get_current_user_from_jwt),
+) -> PreferencesRead:
+    """Read the account's PR review preferences."""
+    return PreferencesRead(
+        strict=user.strict,
+        enable_pr_review=user.enable_pr_review,
+    )
+
+
+@router.put("/auth/preferences", response_model=PreferencesRead)
+async def update_preferences(
+    payload: PreferencesUpdate,
+    user: User = Depends(get_current_user_from_jwt),
+    db: AsyncSession = Depends(get_db),
+) -> PreferencesRead:
+    """Update the account's PR review preferences. These override the
+    per-installation defaults the GitHub bot was configured with at setup."""
+    if payload.strict is not None:
+        user.strict = payload.strict
+    if payload.enable_pr_review is not None:
+        user.enable_pr_review = payload.enable_pr_review
+    await db.commit()
+    await db.refresh(user)
+    return PreferencesRead(
+        strict=user.strict,
+        enable_pr_review=user.enable_pr_review,
+    )
 
 
 @router.post("/api-keys", status_code=status.HTTP_201_CREATED, response_model=ApiKeyCreated)
