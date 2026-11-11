@@ -31,6 +31,12 @@ class Me(BaseModel):
     email: EmailStr
     plan: Plan
     admin: bool = Field(description="Whether the backend verifies this account as an admin.")
+    strict: bool = Field(
+        description="Whether the GitHub bot fails PR checks for mixed changes or correctness findings."
+    )
+    enable_pr_review: bool = Field(
+        description="Whether the GitHub bot posts inline PR reviews with correctness findings."
+    )
 
 
 class GithubAuthorizeRequest(BaseModel):

@@ -32,6 +32,11 @@ class User(Base):
     # account owner may use the app through this key.
     github_logins: Mapped[list[str]] = mapped_column(JSON, default=list, server_default="[]")
 
+    # PR review preferences controlled from the web profile. These override
+    # the per-installation defaults the bot was configured with at setup.
+    strict: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    enable_pr_review: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+
     api_keys: Mapped[list["ApiKey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
     def allows_github_login(self, login: str) -> bool:
