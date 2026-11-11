@@ -178,8 +178,9 @@ async def enforce_analyze_rate_limit(
     user: User = Depends(get_current_user_from_api_key),
 ) -> None:
     """Per-user daily quota for AI endpoints; sets X-RateLimit-* headers."""
+    plan = user.effective_plan
     decision = get_limiter().check(
-        f"user:{user.id}", analyze_daily_limit(user.plan), ANALYZE_WINDOW_SECONDS
+        f"user:{user.id}", analyze_daily_limit(plan), ANALYZE_WINDOW_SECONDS
     )
     for name, value in _rate_headers(decision).items():
         response.headers[name] = value

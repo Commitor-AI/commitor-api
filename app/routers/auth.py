@@ -67,7 +67,7 @@ async def signup(payload: UserCreate, db: AsyncSession = Depends(get_db)) -> Tok
     except IntegrityError:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    return Token(access_token=create_access_token(user.id, user.plan))
+    return Token(access_token=create_access_token(user.id, user.effective_plan))
 
 
 @router.post(
@@ -82,7 +82,7 @@ async def login(payload: UserCreate, db: AsyncSession = Depends(get_db)) -> Toke
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
     if _sync_admin_flag(user, email):
         await db.commit()
-    return Token(access_token=create_access_token(user.id, user.plan))
+    return Token(access_token=create_access_token(user.id, user.effective_plan))
 
 
 @router.get("/me", response_model=Me)
@@ -99,7 +99,7 @@ async def me(
         await db.commit()
     return Me(
         email=user.email,
-        plan=user.plan,
+        plan=user.effective_plan,
         admin=user.is_admin,
         strict=user.strict,
         enable_pr_review=user.enable_pr_review,
@@ -118,7 +118,7 @@ async def github_authorize(
     return GithubAuthorizeResponse(
         authorized=user.allows_github_login(payload.login),
         email=user.email,
-        plan=user.plan,
+        plan=user.effective_plan,
     )
 
 

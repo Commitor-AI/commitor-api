@@ -39,6 +39,11 @@ class User(Base):
 
     api_keys: Mapped[list["ApiKey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
+    @property
+    def effective_plan(self) -> Plan:
+        """Plan used for access control: admins always get Pro access."""
+        return Plan.pro if self.is_admin else self.plan
+
     def allows_github_login(self, login: str) -> bool:
         wanted = {g.strip().lower() for g in (self.github_logins or []) if g.strip()}
         return login.strip().lower() in wanted

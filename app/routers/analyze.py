@@ -22,7 +22,7 @@ async def analyze(
     # Plan-gated size cap. The schema only rejects above the absolute
     # ceiling; the real Free/Pro limit is enforced here so the message
     # can tell the user to upgrade.
-    limit = analyze_max_diff_chars(user.plan)
-    if len(payload.diff) > limit:
-        raise DiffTooLarge(limit, user.plan)
+    limit = analyze_max_diff_chars(user.effective_plan)
+    if len(pending.diff) > limit:
+        raise DiffTooLarge(limit, user.effective_plan)
     return await analyze_diff(payload)
